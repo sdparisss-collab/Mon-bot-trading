@@ -1,0 +1,29 @@
+//@version=5
+strategy("SMA Cross Bot", overlay=true, default_qty_type=strategy.percent_of_equity, default_qty_value=10)
+
+// --- Paramètres réglables ---
+smaRapideLen = input.int(9, title="SMA rapide")
+smaLenteLen  = input.int(21, title="SMA lente")
+
+// --- Calcul des moyennes mobiles ---
+smaRapide = ta.sma(close, smaRapideLen)
+smaLente  = ta.sma(close, smaLenteLen)
+
+// --- Conditions d'entrée / sortie ---
+achat  = ta.crossover(smaRapide, smaLente)
+vente  = ta.crossunder(smaRapide, smaLente)
+
+if achat
+    strategy.entry("Long", strategy.long)
+
+if vente
+    strategy.close("Long")
+
+// --- Affichage sur le graphique ---
+plot(smaRapide, color=color.blue, title="SMA rapide")
+plot(smaLente, color=color.orange, title="SMA lente")
+
+// IMPORTANT : pour envoyer les signaux vers le serveur (webhook),
+// tu ne codes pas d'alertcondition ici. Tu crées une ALERTE sur cette
+// stratégie directement dans l'interface TradingView, avec l'option
+// "Order fills only" et un message au format JSON (voir README).

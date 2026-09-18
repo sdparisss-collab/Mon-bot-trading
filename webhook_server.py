@@ -1,1769 +1,1384 @@
 """
+WEBHOOK SERVER
+TradingView -> Render -> Alpaca PAPER TRADING -> Telegram
 
-Serveur webhook TradingView -> Alpaca PAPER TRADING.
-
-TradingView envoie uniquement :
-
-{
-
-    "secret": "...",
-
-    "symbol": "AAPL",
-
-    "action": "buy"
-
-}
-
-La quantité N'EST PLUS acceptée depuis TradingView.
-
-Le serveur la calcule lui-même à partir :
-
-- du capital réel du compte Alpaca
-
-- du risque maximal par trade
-
-- du stop-loss
-
-- du prix actuel
-
-- du buying power
-
-- des limites de sécurité
-
-Variables Render obligatoires :
-
-    ALPACA_API_KEY
-
-    ALPACA_SECRET_KEY
-
-    WEBHOOK_SECRET
-
-Variables optionnelles :
-
-    TELEGRAM_BOT_TOKEN
-
-    TELEGRAM_CHAT_ID
-
+IMPORTANT :
+- Ce fichier est prévu pour Alpaca PAPER TRADING.
+- TradingView envoie uniquement : secret / action / symbol.
+- La quantité est calculée ici.
+- Les BUY utilisent un BRACKET ORDER Alpaca :
+      entrée + Take Profit + Stop Loss
+- Aucun ordre n'est envoyé à un compte Alpaca LIVE.
 """
 
 import os
-
-import sys
-
 import time
+import uuid
+import logging
+from datetime import datetime, timezone
 
 import requests
-
 from flask import Flask, request, jsonify
 
-app = Flask(__name__)
 
-# ============================================================================
-
+# ============================================================
 # CONFIGURATION
+# ============================================================
 
-# ============================================================================
+APP_NAME = "TradingView-Alpaca-Paper-Bot"
 
-ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY")
-
-ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY")
-
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")
-
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-
-# PAPER TRADING UNIQUEMENT
-
+# Alpaca PAPER uniquement
 ALPACA_BASE_URL = "https://paper-api.alpaca.markets"
-
 ALPACA_DATA_URL = "https://data.alpaca.markets"
+
+API_KEY = os.getenv("ALPACA_API_KEY")
+SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+
+# ============================================================
+# TRADING SETTINGS
+# ============================================================
 
 TRADING_ENABLED = True
 
-# ---------------------------------------------------------------------------
-
-# RISQUE
-
-# ---------------------------------------------------------------------------
-
-# Risque maximum théorique du capital par trade.
-
-# Exemple : 1% d'un compte de 500$ = 5$ de risque théorique.
-
 RISK_PER_TRADE_PERCENT = 1.0
 
-# Stop et Take Profit
-
 STOP_LOSS_PERCENT = 2.0
-
 TAKE_PROFIT_PERCENT = 4.0
-
-# ---------------------------------------------------------------------------
-
-# LIMITES DE SECURITE
-
-# ---------------------------------------------------------------------------
-
-# Nombre maximum d'actions achetées par ordre.
-
-MAX_QTY = 10
-
-# Valeur maximum d'une position en % de l'equity.
-
-# Exemple : 20% d'un compte de 500$ = 100$ maximum sur une position.
-
-MAX_POSITION_VALUE_PERCENT = 20.0
-
-# Nombre maximum de positions simultanées.
-
-MAX_OPEN_POSITIONS = 3
-
-# Perte maximale quotidienne.
 
 MAX_DAILY_LOSS_PERCENT = 5.0
 
-# ---------------------------------------------------------------------------
+MAX_OPEN_POSITIONS = 3
 
-# PROTECTIONS CONTRE LES DOUBLONS
+MAX_QTY = 10
 
-# ---------------------------------------------------------------------------
+MAX_POSITION_VALUE_PERCENT = 20.0
 
+# Anti-doublon
 DUPLICATE_WINDOW_SECONDS = 30
 
+# Empêche un nouveau signal immédiat sur le même symbole/action
 SYMBOL_ACTION_COOLDOWN_SECONDS = 120
 
-# ---------------------------------------------------------------------------
+# Temps maximum d'attente pour un ordre
+ORDER_POLL_SECONDS = 15
 
-# POLLING DES ORDRES
+# Feed de données
+DATA_FEED = "iex"
 
-# ---------------------------------------------------------------------------
 
-FILL_POLL_ATTEMPTS = 10
+# ============================================================
+# FLASK
+# ============================================================
 
-FILL_POLL_DELAY_SECONDS = 0.5
+app = Flask(__name__)
 
-# ============================================================================
 
-# HEADERS
-
-# ============================================================================
-
-HEADERS = {
-
-    "APCA-API-KEY-ID": ALPACA_API_KEY,
-
-    "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
-
-}
-
-DATA_HEADERS = {
-
-    "APCA-API-KEY-ID": ALPACA_API_KEY,
-
-    "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
-
-}
-
-# ============================================================================
-
-# ETAT INTERNE
-
-# ============================================================================
-
-_last_signals = {}
-
-_cooldown = {}
-
-_daily_start_equity = {
-
-    "value": None,
-
-    "date": None,
-
-}
-
-# ============================================================================
-
+# ============================================================
 # LOGGING
+# ============================================================
 
-# ============================================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
 
-def log(message):
+logger = logging.getLogger(APP_NAME)
 
-    print(f"[BOT] {message}", flush=True)
+
+# ============================================================
+# VALIDATION ENV
+# ============================================================
+
+if not API_KEY:
+    raise RuntimeError("ALPACA_API_KEY manquante")
+
+if not SECRET_KEY:
+    raise RuntimeError("ALPACA_SECRET_KEY manquante")
+
+if not WEBHOOK_SECRET:
+    raise RuntimeError("WEBHOOK_SECRET manquante")
+
+
+# ============================================================
+# HTTP SESSION
+# ============================================================
+
+session = requests.Session()
+
+session.headers.update({
+    "APCA-API-KEY-ID": API_KEY,
+    "APCA-API-SECRET-KEY": SECRET_KEY,
+    "Content-Type": "application/json",
+})
+
+
+# ============================================================
+# MÉMOIRE ANTI-DOUBLON
+# ============================================================
+
+recent_signals = {}
+
+recent_actions = {}
+
+
+# ============================================================
+# OUTILS
+# ============================================================
+
+def now_ts():
+    return time.time()
+
+
+def utc_string():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def clean_symbol(symbol):
+    if not isinstance(symbol, str):
+        return None
+
+    symbol = symbol.strip().upper()
+
+    if not symbol:
+        return None
+
+    # On accepte uniquement des tickers simples.
+    if not symbol.isalnum():
+        return None
+
+    if len(symbol) > 10:
+        return None
+
+    return symbol
+
+
+def clean_action(action):
+    if not isinstance(action, str):
+        return None
+
+    action = action.strip().lower()
+
+    if action not in ("buy", "sell"):
+        return None
+
+    return action
+
+
+def safe_float(value, default=None):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def safe_int(value, default=None):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+# ============================================================
+# TELEGRAM
+# ============================================================
 
 def send_telegram(message):
-
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-
         return
 
     try:
+        url = (
+            f"https://api.telegram.org/bot"
+            f"{TELEGRAM_BOT_TOKEN}/sendMessage"
+        )
+
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message,
+        }
 
         requests.post(
-
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-
-            json={
-
-                "chat_id": TELEGRAM_CHAT_ID,
-
-                "text": message,
-
-            },
-
-            timeout=10,
-
+            url,
+            json=payload,
+            timeout=8
         )
 
-    except Exception as e:
+    except Exception as exc:
+        logger.warning("Telegram indisponible : %s", exc)
 
-        log(f"Échec Telegram : {e}")
 
-# ============================================================================
+def notify(message):
+    logger.info(message)
+    send_telegram(message)
 
-# ENVIRONNEMENT
 
-# ============================================================================
+# ============================================================
+# ALPACA HTTP
+# ============================================================
 
-def check_env_vars_or_exit():
+def alpaca_request(
+    method,
+    endpoint,
+    *,
+    params=None,
+    json_data=None,
+    timeout=10
+):
+    url = ALPACA_BASE_URL + endpoint
 
-    missing = [
+    response = session.request(
+        method=method,
+        url=url,
+        params=params,
+        json=json_data,
+        timeout=timeout
+    )
 
-        name
+    if not response.ok:
+        try:
+            error_body = response.json()
+        except Exception:
+            error_body = response.text
 
-        for name in (
-
-            "ALPACA_API_KEY",
-
-            "ALPACA_SECRET_KEY",
-
-            "WEBHOOK_SECRET",
-
+        raise RuntimeError(
+            f"Alpaca HTTP {response.status_code}: {error_body}"
         )
 
-        if not os.environ.get(name)
+    if not response.text:
+        return {}
 
-    ]
+    try:
+        return response.json()
+    except Exception:
+        return response.text
 
-    if missing:
 
-        msg = (
-
-            "🛑 DÉMARRAGE BLOQUÉ : variables manquantes : "
-
-            + ", ".join(missing)
-
-        )
-
-        log(msg)
-
-        send_telegram(msg)
-
-        sys.exit(1)
-
-    log("Toutes les variables essentielles sont présentes.")
-
-# ============================================================================
-
-# ALPACA - COMPTE
-
-# ============================================================================
+# ============================================================
+# COMPTE ALPACA
+# ============================================================
 
 def get_account():
-
-    response = requests.get(
-
-        f"{ALPACA_BASE_URL}/v2/account",
-
-        headers=HEADERS,
-
-        timeout=10,
-
+    return alpaca_request(
+        "GET",
+        "/v2/account"
     )
 
-    response.raise_for_status()
-
-    return response.json()
 
 def get_equity():
-
     account = get_account()
 
-    return float(account["equity"])
+    equity = safe_float(account.get("equity"))
 
-def get_buying_power():
-
-    account = get_account()
-
-    return float(account["buying_power"])
-
-# ============================================================================
-
-# ALPACA - POSITIONS
-
-# ============================================================================
-
-def get_open_positions():
-
-    response = requests.get(
-
-        f"{ALPACA_BASE_URL}/v2/positions",
-
-        headers=HEADERS,
-
-        timeout=10,
-
-    )
-
-    response.raise_for_status()
-
-    return response.json()
-
-def get_position(symbol):
-
-    try:
-
-        response = requests.get(
-
-            f"{ALPACA_BASE_URL}/v2/positions/{symbol}",
-
-            headers=HEADERS,
-
-            timeout=10,
-
+    if equity is None or equity <= 0:
+        raise RuntimeError(
+            "Impossible de récupérer l'equity Alpaca."
         )
 
-        if response.status_code == 404:
+    return equity
 
-            return None
 
-        response.raise_for_status()
+# ============================================================
+# PERTE JOURNALIÈRE
+# ============================================================
 
-        return response.json()
+def check_daily_loss():
+    account = get_account()
 
-    except requests.exceptions.RequestException:
+    equity = safe_float(account.get("equity"))
+    last_equity = safe_float(account.get("last_equity"))
 
-        return None
+    if equity is None:
+        return False, "Equity Alpaca invalide."
 
-def get_position_qty(symbol):
+    if last_equity is None or last_equity <= 0:
+        return True, "Référence journalière indisponible."
 
-    position = get_position(symbol)
-
-    if not position:
-
-        return 0
-
-    try:
-
-        return float(position.get("qty", 0))
-
-    except (TypeError, ValueError):
-
-        return 0
-
-# ============================================================================
-
-# ALPACA - PRIX
-
-# ============================================================================
-
-def get_latest_price(symbol):
-
-    """
-
-    Récupère le dernier prix connu de l'action.
-
-    """
-
-    response = requests.get(
-
-        f"{ALPACA_DATA_URL}/v2/stocks/{symbol}/trades/latest",
-
-        headers=DATA_HEADERS,
-
-        timeout=10,
-
-        params={
-
-            "feed": "iex",
-
-        },
-
+    daily_change_percent = (
+        (equity - last_equity)
+        / last_equity
+        * 100
     )
 
-    response.raise_for_status()
+    if daily_change_percent <= -MAX_DAILY_LOSS_PERCENT:
+        return (
+            False,
+            (
+                f"Limite de perte journalière atteinte : "
+                f"{daily_change_percent:.2f}%"
+            )
+        )
+
+    return (
+        True,
+        f"Variation journalière : {daily_change_percent:+.2f}%"
+    )
+
+
+# ============================================================
+# POSITIONS
+# ============================================================
+
+def get_positions():
+    return alpaca_request(
+        "GET",
+        "/v2/positions"
+    )
+
+
+def get_position(symbol):
+    positions = get_positions()
+
+    for position in positions:
+        if position.get("symbol") == symbol:
+            return position
+
+    return None
+
+
+def count_open_positions():
+    positions = get_positions()
+
+    return len(positions)
+
+
+# ============================================================
+# ORDRES
+# ============================================================
+
+def get_open_orders(symbol=None):
+    params = {
+        "status": "open",
+        "nested": "true",
+    }
+
+    if symbol:
+        params["symbols"] = symbol
+
+    return alpaca_request(
+        "GET",
+        "/v2/orders",
+        params=params
+    )
+
+
+def cancel_orders_for_symbol(symbol):
+    orders = get_open_orders(symbol)
+
+    if not orders:
+        return
+
+    for order in orders:
+        order_id = order.get("id")
+
+        if not order_id:
+            continue
+
+        try:
+            alpaca_request(
+                "DELETE",
+                f"/v2/orders/{order_id}"
+            )
+
+            logger.info(
+                "Ordre annulé : %s | %s",
+                symbol,
+                order_id
+            )
+
+        except Exception as exc:
+            logger.warning(
+                "Impossible d'annuler %s : %s",
+                order_id,
+                exc
+            )
+
+
+def wait_until_no_open_orders(symbol, timeout=5):
+    deadline = time.time() + timeout
+
+    while time.time() < deadline:
+
+        try:
+            orders = get_open_orders(symbol)
+
+            if not orders:
+                return True
+
+        except Exception as exc:
+            logger.warning(
+                "Erreur vérification ordres %s : %s",
+                symbol,
+                exc
+            )
+
+        time.sleep(0.25)
+
+    return False
+
+
+# ============================================================
+# PRIX ALPACA
+# ============================================================
+
+def get_latest_price(symbol):
+    url = (
+        f"{ALPACA_DATA_URL}"
+        f"/v2/stocks/{symbol}/trades/latest"
+    )
+
+    response = session.get(
+        url,
+        params={"feed": DATA_FEED},
+        timeout=8
+    )
+
+    if not response.ok:
+
+        try:
+            body = response.json()
+        except Exception:
+            body = response.text
+
+        raise RuntimeError(
+            f"Prix Alpaca HTTP {response.status_code}: {body}"
+        )
 
     data = response.json()
 
     trade = data.get("trade", {})
 
-    price = trade.get("p")
+    price = safe_float(trade.get("p"))
 
-    if price is None:
-
-        raise ValueError(f"Prix indisponible pour {symbol}")
-
-    price = float(price)
-
-    if price <= 0:
-
-        raise ValueError(f"Prix invalide pour {symbol}: {price}")
+    if price is None or price <= 0:
+        raise RuntimeError(
+            f"Prix invalide reçu pour {symbol}."
+        )
 
     return price
 
-# ============================================================================
 
-# PERTE QUOTIDIENNE
+# ============================================================
+# CALCUL SL / TP
+# ============================================================
 
-# ============================================================================
+def calculate_exit_prices(reference_price):
 
-def check_daily_loss_limit():
-
-    account = get_account()
-
-    equity = float(account["equity"])
-
-    today = time.strftime("%Y-%m-%d")
-
-    if _daily_start_equity["date"] != today:
-
-        _daily_start_equity["date"] = today
-
-        _daily_start_equity["value"] = equity
-
-        log(
-
-            f"Nouvelle journée : equity de référence = "
-
-            f"{equity:.2f}"
-
-        )
-
-    start_equity = _daily_start_equity["value"]
-
-    if not start_equity or start_equity <= 0:
-
-        return True, 0.0
-
-    loss_percent = (
-
-        (start_equity - equity)
-
-        / start_equity
-
-    ) * 100
-
-    return (
-
-        loss_percent < MAX_DAILY_LOSS_PERCENT,
-
-        loss_percent,
-
+    stop_price = (
+        reference_price
+        * (1 - STOP_LOSS_PERCENT / 100)
     )
 
-# ============================================================================
-
-# ANTI-DOUBLONS
-
-# ============================================================================
-
-def is_duplicate_signal(symbol, action):
-
-    key = f"{symbol}_{action}"
-
-    now = time.time()
-
-    last_time = _last_signals.get(key)
-
-    _last_signals[key] = now
-
-    return bool(
-
-        last_time
-
-        and (now - last_time) < DUPLICATE_WINDOW_SECONDS
-
+    take_profit_price = (
+        reference_price
+        * (1 + TAKE_PROFIT_PERCENT / 100)
     )
 
-def is_on_cooldown(symbol, action):
-
-    key = f"{symbol}_{action}"
-
-    now = time.time()
-
-    last_trade = _cooldown.get(key)
-
-    return bool(
-
-        last_trade
-
-        and (now - last_trade)
-
-        < SYMBOL_ACTION_COOLDOWN_SECONDS
-
-    )
-
-def mark_traded(symbol, action):
-
-    _cooldown[f"{symbol}_{action}"] = time.time()
-
-# ============================================================================
-
-# VALIDATION DU WEBHOOK
-
-# ============================================================================
-
-def validate_webhook(symbol, action):
-
-    if not symbol:
-
-        return False, "symbole vide"
-
-    if not symbol.isalnum():
-
-        return False, "symbole invalide"
-
-    if len(symbol) > 10:
-
-        return False, "symbole trop long"
-
-    if action not in ("buy", "sell"):
-
-        return False, "action invalide"
-
-    return True, None
-
-# ============================================================================
-
-# CALCUL DE POSITION
-
-# ============================================================================
-
-def calculate_buy_quantity(symbol, price):
-
-    """
-
-    Calcule la quantité à acheter.
-
-    Le serveur ignore totalement la quantité provenant
-
-    de TradingView.
-
-    Formule principale :
-
-        risque $ = equity × risque %
-
-        risque/action =
-
-            prix × stop %
-
-        qty risque =
-
-            risque $ / risque/action
-
-    Puis on applique :
-
-        - MAX_QTY
-
-        - MAX_POSITION_VALUE_PERCENT
-
-        - buying power
-
-    """
-
-    account = get_account()
-
-    equity = float(account["equity"])
-
-    buying_power = float(account["buying_power"])
-
-    if equity <= 0:
-
-        raise ValueError("Equity Alpaca invalide")
-
-    if buying_power <= 0:
-
-        raise ValueError("Buying power insuffisant")
-
-    # ------------------------------------------------------------------------
-
-    # Budget de risque
-
-    # ------------------------------------------------------------------------
-
-    risk_budget = (
-
-        equity
-
-        * (RISK_PER_TRADE_PERCENT / 100.0)
-
-    )
-
-    # ------------------------------------------------------------------------
-
-    # Risque théorique par action
-
-    # ------------------------------------------------------------------------
-
-    risk_per_share = (
-
-        price
-
-        * (STOP_LOSS_PERCENT / 100.0)
-
-    )
-
-    if risk_per_share <= 0:
-
-        raise ValueError("Risque par action invalide")
-
-    # ------------------------------------------------------------------------
-
-    # Quantité basée sur le risque
-
-    # ------------------------------------------------------------------------
-
-    qty_by_risk = int(
-
-        risk_budget / risk_per_share
-
-    )
-
-    # ------------------------------------------------------------------------
-
-    # Valeur maximale de position
-
-    # ------------------------------------------------------------------------
-
-    max_position_value = (
-
-        equity
-
-        * (MAX_POSITION_VALUE_PERCENT / 100.0)
-
-    )
-
-    qty_by_position_value = int(
-
-        max_position_value / price
-
-    )
-
-    # ------------------------------------------------------------------------
-
-    # Buying power
-
-    # ------------------------------------------------------------------------
-
-    qty_by_buying_power = int(
-
-        buying_power / price
-
-    )
-
-    # ------------------------------------------------------------------------
-
-    # Quantité finale
-
-    # ------------------------------------------------------------------------
-
-    qty = min(
-
-        qty_by_risk,
-
-        qty_by_position_value,
-
-        qty_by_buying_power,
-
-        MAX_QTY,
-
-    )
-
-    log(
-
-        f"CALCUL POSITION {symbol} | "
-
-        f"equity={equity:.2f} | "
-
-        f"buying_power={buying_power:.2f} | "
-
-        f"prix={price:.2f} | "
-
-        f"risk_budget={risk_budget:.2f} | "
-
-        f"risk/action={risk_per_share:.2f} | "
-
-        f"qty_risk={qty_by_risk} | "
-
-        f"qty_position={qty_by_position_value} | "
-
-        f"qty_buying_power={qty_by_buying_power} | "
-
-        f"qty_finale={qty}"
-
-    )
-
-    if qty < 1:
-
-        raise ValueError(
-
-            "Capital insuffisant pour ouvrir une position "
-
-            "respectant les règles de risque"
-
-        )
-
-    return qty
-
-# ============================================================================
-
-# ORDRES
-
-# ============================================================================
-
-def submit_market_order(symbol, side, qty):
-
-    order = {
-
-        "symbol": symbol,
-
-        "qty": qty,
-
-        "side": side,
-
-        "type": "market",
-
-        "time_in_force": "day",
-
-    }
-
-    response = requests.post(
-
-        f"{ALPACA_BASE_URL}/v2/orders",
-
-        json=order,
-
-        headers=HEADERS,
-
-        timeout=10,
-
-    )
-
-    response.raise_for_status()
-
-    return response.json()
-
-# ============================================================================
-
-# SUIVI DU REMPLISSAGE
-
-# ============================================================================
-
-def poll_order_fill(order_id):
-
-    for _ in range(FILL_POLL_ATTEMPTS):
-
-        try:
-
-            response = requests.get(
-
-                f"{ALPACA_BASE_URL}/v2/orders/{order_id}",
-
-                headers=HEADERS,
-
-                timeout=10,
-
-            )
-
-            response.raise_for_status()
-
-            order = response.json()
-
-            if order.get("filled_avg_price"):
-
-                return order
-
-            if order.get("status") in (
-
-                "canceled",
-
-                "rejected",
-
-                "expired",
-
-            ):
-
-                return order
-
-        except Exception as e:
-
-            log(
-
-                f"Erreur polling ordre {order_id}: {e}"
-
-            )
-
-        time.sleep(FILL_POLL_DELAY_SECONDS)
-
-    return None
-
-# ============================================================================
-
-# SL / TP
-
-# ============================================================================
-
-def place_exit_orders(symbol, qty, entry_price):
-
-    """
-
-    OCO :
-
-        - stop-loss
-
-        - take-profit
-
-    Utilise la quantité réellement remplie.
-
-    """
-
-    if qty <= 0:
-
-        raise ValueError("Quantité SL/TP invalide")
-
-    stop_price = round(
-
-        entry_price
-
-        * (1 - STOP_LOSS_PERCENT / 100),
-
-        2,
-
-    )
-
-    take_profit_price = round(
-
-        entry_price
-
-        * (1 + TAKE_PROFIT_PERCENT / 100),
-
-        2,
-
-    )
+    # Alpaca accepte des prix avec décimales.
+    stop_price = round(stop_price, 2)
+    take_profit_price = round(take_profit_price, 2)
 
     if stop_price <= 0:
+        raise RuntimeError("Stop Loss invalide.")
 
-        raise ValueError("Stop-loss invalide")
-
-    order = {
-
-        "symbol": symbol,
-
-        "qty": qty,
-
-        "side": "sell",
-
-        "type": "limit",
-
-        "limit_price": take_profit_price,
-
-        "time_in_force": "gtc",
-
-        "order_class": "oco",
-
-        "stop_loss": {
-
-            "stop_price": stop_price,
-
-        },
-
-    }
-
-    response = requests.post(
-
-        f"{ALPACA_BASE_URL}/v2/orders",
-
-        json=order,
-
-        headers=HEADERS,
-
-        timeout=10,
-
-    )
-
-    response.raise_for_status()
+    if take_profit_price <= stop_price:
+        raise RuntimeError(
+            "Take Profit doit être supérieur au Stop Loss."
+        )
 
     return stop_price, take_profit_price
 
-# ============================================================================
 
-# WEBHOOK
+# ============================================================
+# CALCUL QUANTITÉ
+# ============================================================
 
-# ============================================================================
+def calculate_quantity(symbol, price):
 
-@app.route("/webhook", methods=["POST"])
+    account = get_account()
 
-def webhook():
+    equity = safe_float(account.get("equity"))
+    buying_power = safe_float(account.get("buying_power"))
 
-    data = request.get_json(
+    if equity is None or equity <= 0:
+        raise RuntimeError("Equity invalide.")
 
-        force=True,
+    if buying_power is None or buying_power <= 0:
+        raise RuntimeError("Buying power insuffisant.")
 
-        silent=True,
+    # --------------------------------------------------------
+    # 1. Risque maximum autorisé
+    # --------------------------------------------------------
 
-    ) or {}
-
-    timestamp = time.strftime(
-
-        "%Y-%m-%d %H:%M:%S"
-
+    risk_budget = (
+        equity
+        * RISK_PER_TRADE_PERCENT
+        / 100
     )
 
-    # ------------------------------------------------------------------------
-
-    # SECRET
-
-    # ------------------------------------------------------------------------
-
-    if data.get("secret") != WEBHOOK_SECRET:
-
-        log("Requête reçue avec un secret invalide.")
-
-        return jsonify({
-
-            "error": "secret invalide"
-
-        }), 403
-
-    # ------------------------------------------------------------------------
-
-    # DONNÉES
-
-    # ------------------------------------------------------------------------
-
-    action = str(
-
-        data.get("action", "")
-
-    ).lower()
-
-    symbol = str(
-
-        data.get("symbol", "")
-
-    ).upper()
-
-    # IMPORTANT :
-
-    # On ne lit volontairement PAS data["qty"].
-
-    #
-
-    # TradingView peut envoyer 301, 500 ou autre chose :
-
-    # cette valeur est complètement ignorée.
-
-    valid, error = validate_webhook(
-
-        symbol,
-
-        action,
-
+    risk_per_share = (
+        price
+        * STOP_LOSS_PERCENT
+        / 100
     )
 
-    if not valid:
+    if risk_per_share <= 0:
+        raise RuntimeError("Risque par action invalide.")
 
-        msg = (
+    qty_by_risk = int(
+        risk_budget / risk_per_share
+    )
 
-            f"⚠️ [{timestamp}] "
+    # --------------------------------------------------------
+    # 2. Valeur maximale d'une position
+    # --------------------------------------------------------
 
-            f"Signal rejeté : {error}"
+    max_position_value = (
+        equity
+        * MAX_POSITION_VALUE_PERCENT
+        / 100
+    )
 
+    qty_by_position = int(
+        max_position_value / price
+    )
+
+    # --------------------------------------------------------
+    # 3. Buying power
+    # --------------------------------------------------------
+
+    qty_by_buying_power = int(
+        buying_power / price
+    )
+
+    # --------------------------------------------------------
+    # 4. Limite absolue
+    # --------------------------------------------------------
+
+    quantity = min(
+        qty_by_risk,
+        qty_by_position,
+        qty_by_buying_power,
+        MAX_QTY
+    )
+
+    if quantity < 1:
+        raise RuntimeError(
+            (
+                f"Quantité calculée = 0. "
+                f"Prix={price:.2f}, "
+                f"equity={equity:.2f}, "
+                f"buying_power={buying_power:.2f}"
+            )
         )
 
-        log(msg)
+    return quantity
 
-        send_telegram(msg)
 
-        return jsonify({
+# ============================================================
+# ORDRE BRACKET BUY
+# ============================================================
 
-            "error": error
+def submit_bracket_buy(symbol, quantity, reference_price):
 
-        }), 400
+    stop_price, take_profit_price = (
+        calculate_exit_prices(reference_price)
+    )
 
-    # ------------------------------------------------------------------------
+    client_order_id = (
+        f"tv-{symbol.lower()}-"
+        f"{uuid.uuid4().hex[:20]}"
+    )
 
-    # TRADING ACTIVÉ ?
+    payload = {
+        "symbol": symbol,
+        "qty": str(quantity),
+        "side": "buy",
+        "type": "market",
+        "time_in_force": "day",
+        "order_class": "bracket",
+        "client_order_id": client_order_id,
 
-    # ------------------------------------------------------------------------
+        "take_profit": {
+            "limit_price": f"{take_profit_price:.2f}"
+        },
+
+        "stop_loss": {
+            "stop_price": f"{stop_price:.2f}"
+        }
+    }
+
+    try:
+        order = alpaca_request(
+            "POST",
+            "/v2/orders",
+            json_data=payload
+        )
+
+    except Exception as exc:
+
+        notify(
+            (
+                f"🚨 ÉCHEC BUY {symbol}\n"
+                f"Erreur : {exc}"
+            )
+        )
+
+        raise
+
+    return order, stop_price, take_profit_price
+
+
+# ============================================================
+# SELL MARKET
+# ============================================================
+
+def submit_market_sell(symbol, quantity):
+
+    client_order_id = (
+        f"tv-{symbol.lower()}-sell-"
+        f"{uuid.uuid4().hex[:16]}"
+    )
+
+    payload = {
+        "symbol": symbol,
+        "qty": str(quantity),
+        "side": "sell",
+        "type": "market",
+        "time_in_force": "day",
+        "client_order_id": client_order_id,
+    }
+
+    return alpaca_request(
+        "POST",
+        "/v2/orders",
+        json_data=payload
+    )
+
+
+# ============================================================
+# STATUT ORDRE
+# ============================================================
+
+def get_order(order_id):
+
+    return alpaca_request(
+        "GET",
+        f"/v2/orders/{order_id}"
+    )
+
+
+def wait_for_order(order_id):
+
+    deadline = time.time() + ORDER_POLL_SECONDS
+
+    last_status = None
+
+    while time.time() < deadline:
+
+        try:
+            order = get_order(order_id)
+
+            status = order.get("status")
+
+            last_status = status
+
+            if status in (
+                "filled",
+                "partially_filled",
+                "canceled",
+                "expired",
+                "rejected",
+                "done_for_day"
+            ):
+                return order
+
+        except Exception as exc:
+            logger.warning(
+                "Erreur statut ordre %s : %s",
+                order_id,
+                exc
+            )
+
+        time.sleep(0.5)
+
+    try:
+        return get_order(order_id)
+    except Exception:
+        return {
+            "id": order_id,
+            "status": last_status or "unknown"
+        }
+
+
+# ============================================================
+# ANTI-DOUBLON
+# ============================================================
+
+def is_duplicate_signal(action, symbol):
+
+    key = f"{action}:{symbol}"
+
+    current = now_ts()
+
+    previous = recent_signals.get(key)
+
+    if previous is not None:
+
+        if current - previous < DUPLICATE_WINDOW_SECONDS:
+            return True
+
+    recent_signals[key] = current
+
+    # Nettoyage léger
+    cutoff = current - 600
+
+    for k in list(recent_signals.keys()):
+
+        if recent_signals[k] < cutoff:
+            del recent_signals[k]
+
+    return False
+
+
+def is_action_on_cooldown(action, symbol):
+
+    key = f"{action}:{symbol}"
+
+    current = now_ts()
+
+    previous = recent_actions.get(key)
+
+    if previous is not None:
+
+        if current - previous < SYMBOL_ACTION_COOLDOWN_SECONDS:
+            return True
+
+    return False
+
+
+def register_action(action, symbol):
+    recent_actions[f"{action}:{symbol}"] = now_ts()
+
+
+# ============================================================
+# BUY
+# ============================================================
+
+def handle_buy(symbol):
 
     if not TRADING_ENABLED:
+        return {
+            "ok": False,
+            "reason": "Trading désactivé."
+        }
 
-        msg = (
+    # --------------------------------------------------------
+    # Daily loss
+    # --------------------------------------------------------
 
-            f"⏸️ [{timestamp}] "
+    allowed, reason = check_daily_loss()
 
-            f"Signal {action.upper()} {symbol} reçu "
+    if not allowed:
 
-            f"mais trading désactivé"
-
+        notify(
+            f"🛑 BUY {symbol} BLOQUÉ\n"
+            f"Raison : {reason}"
         )
 
-        log(msg)
+        return {
+            "ok": False,
+            "reason": reason
+        }
 
-        send_telegram(msg)
+    # --------------------------------------------------------
+    # Nombre de positions
+    # --------------------------------------------------------
 
-        return jsonify({
+    positions_count = count_open_positions()
 
-            "info": "trading désactivé"
+    if positions_count >= MAX_OPEN_POSITIONS:
 
-        }), 200
+        reason = (
+            f"Maximum de positions atteint "
+            f"({positions_count}/{MAX_OPEN_POSITIONS})."
+        )
 
-    # ------------------------------------------------------------------------
+        notify(
+            f"⚠️ BUY {symbol} ignoré\n{reason}"
+        )
 
-    # ANTI-DOUBLON
+        return {
+            "ok": False,
+            "reason": reason
+        }
 
-    # ------------------------------------------------------------------------
+    # --------------------------------------------------------
+    # Position déjà existante
+    # --------------------------------------------------------
 
-    if is_duplicate_signal(
+    existing_position = get_position(symbol)
 
+    if existing_position:
+
+        reason = (
+            f"Position {symbol} déjà ouverte."
+        )
+
+        notify(
+            f"⚠️ BUY {symbol} ignoré\n{reason}"
+        )
+
+        return {
+            "ok": False,
+            "reason": reason
+        }
+
+    # --------------------------------------------------------
+    # Ordre déjà ouvert
+    # --------------------------------------------------------
+
+    open_orders = get_open_orders(symbol)
+
+    if open_orders:
+
+        reason = (
+            f"{len(open_orders)} ordre(s) déjà ouvert(s) "
+            f"sur {symbol}."
+        )
+
+        notify(
+            f"⚠️ BUY {symbol} ignoré\n{reason}"
+        )
+
+        return {
+            "ok": False,
+            "reason": reason
+        }
+
+    # --------------------------------------------------------
+    # Prix
+    # --------------------------------------------------------
+
+    reference_price = get_latest_price(symbol)
+
+    # --------------------------------------------------------
+    # Quantité
+    # --------------------------------------------------------
+
+    quantity = calculate_quantity(
         symbol,
+        reference_price
+    )
 
-        action,
+    # --------------------------------------------------------
+    # BUY BRACKET
+    # --------------------------------------------------------
 
+    order, stop_price, take_profit_price = (
+        submit_bracket_buy(
+            symbol,
+            quantity,
+            reference_price
+        )
+    )
+
+    order_id = order.get("id")
+    status = order.get("status")
+
+    register_action("buy", symbol)
+
+    notify(
+        (
+            f"🟢 BUY {symbol}\n"
+            f"Quantité : {quantity}\n"
+            f"Prix référence : ${reference_price:.2f}\n"
+            f"SL : ${stop_price:.2f}\n"
+            f"TP : ${take_profit_price:.2f}\n"
+            f"Risque/trade : {RISK_PER_TRADE_PERCENT:.2f}%\n"
+            f"Order ID : {order_id}\n"
+            f"Statut : {status}\n"
+            f"Mode : PAPER"
+        )
+    )
+
+    return {
+        "ok": True,
+        "action": "buy",
+        "symbol": symbol,
+        "quantity": quantity,
+        "reference_price": reference_price,
+        "stop_loss": stop_price,
+        "take_profit": take_profit_price,
+        "order_id": order_id,
+        "status": status,
+    }
+
+
+# ============================================================
+# SELL
+# ============================================================
+
+def handle_sell(symbol):
+
+    if not TRADING_ENABLED:
+        return {
+            "ok": False,
+            "reason": "Trading désactivé."
+        }
+
+    # --------------------------------------------------------
+    # Récupérer position
+    # --------------------------------------------------------
+
+    position = get_position(symbol)
+
+    if not position:
+
+        reason = (
+            f"Aucune position {symbol} à vendre."
+        )
+
+        notify(
+            f"⚠️ SELL {symbol} ignoré — aucune position"
+        )
+
+        return {
+            "ok": False,
+            "reason": reason
+        }
+
+    # --------------------------------------------------------
+    # Quantité réellement détenue
+    # --------------------------------------------------------
+
+    quantity_float = safe_float(
+        position.get("qty")
+    )
+
+    if quantity_float is None or quantity_float <= 0:
+
+        return {
+            "ok": False,
+            "reason": "Quantité de position invalide."
+        }
+
+    quantity = int(quantity_float)
+
+    if quantity <= 0:
+
+        return {
+            "ok": False,
+            "reason": "Quantité entière insuffisante."
+        }
+
+    # --------------------------------------------------------
+    # Annuler TP / SL / autres ordres
+    # --------------------------------------------------------
+
+    cancel_orders_for_symbol(symbol)
+
+    # --------------------------------------------------------
+    # Attendre que les ordres soient réellement annulés
+    # --------------------------------------------------------
+
+    if not wait_until_no_open_orders(
+        symbol,
+        timeout=5
     ):
 
-        log(
-
-            f"Signal doublon ignoré : "
-
-            f"{action.upper()} {symbol}"
-
+        reason = (
+            "Impossible de confirmer "
+            "l'annulation des ordres existants."
         )
 
-        return jsonify({
-
-            "info": "doublon"
-
-        }), 200
-
-    # ------------------------------------------------------------------------
-
-    # COOLDOWN
-
-    # ------------------------------------------------------------------------
-
-    if is_on_cooldown(
-
-        symbol,
-
-        action,
-
-    ):
-
-        msg = (
-
-            f"⚠️ [{timestamp}] "
-
-            f"{action.upper()} {symbol} ignoré "
-
-            f"— cooldown"
-
+        notify(
+            f"🛑 SELL {symbol} bloqué\n{reason}"
         )
 
-        log(msg)
+        return {
+            "ok": False,
+            "reason": reason
+        }
 
-        send_telegram(msg)
+    # --------------------------------------------------------
+    # Relecture de la position
+    # --------------------------------------------------------
 
-        return jsonify({
+    position = get_position(symbol)
 
-            "info": "cooldown"
+    if not position:
 
-        }), 200
+        notify(
+            f"ℹ️ SELL {symbol} : "
+            f"position déjà fermée."
+        )
 
-    # ------------------------------------------------------------------------
+        return {
+            "ok": True,
+            "action": "sell",
+            "symbol": symbol,
+            "status": "already_closed"
+        }
 
-    # RISQUE QUOTIDIEN
+    quantity_float = safe_float(
+        position.get("qty")
+    )
 
-    # ------------------------------------------------------------------------
+    if quantity_float is None:
+        raise RuntimeError(
+            "Impossible de relire la quantité."
+        )
+
+    quantity = int(quantity_float)
+
+    if quantity <= 0:
+
+        return {
+            "ok": False,
+            "reason": "Position trop petite pour un SELL entier."
+        }
+
+    # --------------------------------------------------------
+    # MARKET SELL
+    # --------------------------------------------------------
 
     try:
 
-        daily_ok, daily_loss = (
-
-            check_daily_loss_limit()
-
+        order = submit_market_sell(
+            symbol,
+            quantity
         )
 
-        if not daily_ok:
+    except Exception as exc:
 
-            msg = (
-
-                f"🛑 [{timestamp}] "
-
-                f"Trading suspendu : perte quotidienne "
-
-                f"{daily_loss:.2f}%"
-
+        notify(
+            (
+                f"🚨 SELL {symbol} ÉCHOUÉ\n"
+                f"Quantité : {quantity}\n"
+                f"Erreur : {exc}"
             )
+        )
 
-            log(msg)
+        raise
 
-            send_telegram(msg)
+    order_id = order.get("id")
+    status = order.get("status")
 
-            return jsonify({
+    register_action("sell", symbol)
 
-                "info": "limite de perte quotidienne atteinte"
+    notify(
+        (
+            f"🔴 SELL {symbol}\n"
+            f"Quantité : {quantity}\n"
+            f"Order ID : {order_id}\n"
+            f"Statut : {status}\n"
+            f"Mode : PAPER"
+        )
+    )
 
-            }), 200
+    return {
+        "ok": True,
+        "action": "sell",
+        "symbol": symbol,
+        "quantity": quantity,
+        "order_id": order_id,
+        "status": status,
+    }
 
-        # ====================================================================
 
-        # BUY
+# ============================================================
+# WEBHOOK
+# ============================================================
 
-        # ====================================================================
+@app.route("/webhook", methods=["POST"])
+def webhook():
+
+    received_at = utc_string()
+
+    # --------------------------------------------------------
+    # JSON
+    # --------------------------------------------------------
+
+    data = request.get_json(
+        silent=True
+    )
+
+    if not isinstance(data, dict):
+
+        return jsonify({
+            "ok": False,
+            "error": "JSON invalide."
+        }), 400
+
+    # --------------------------------------------------------
+    # SECRET
+    # --------------------------------------------------------
+
+    secret = data.get("secret")
+
+    if secret != WEBHOOK_SECRET:
+
+        logger.warning(
+            "Webhook refusé : mauvais secret."
+        )
+
+        return jsonify({
+            "ok": False,
+            "error": "Unauthorized."
+        }), 401
+
+    # --------------------------------------------------------
+    # ACTION
+    # --------------------------------------------------------
+
+    action = clean_action(
+        data.get("action")
+    )
+
+    if action is None:
+
+        return jsonify({
+            "ok": False,
+            "error": "Action invalide."
+        }), 400
+
+    # --------------------------------------------------------
+    # SYMBOL
+    # --------------------------------------------------------
+
+    symbol = clean_symbol(
+        data.get("symbol")
+    )
+
+    if symbol is None:
+
+        return jsonify({
+            "ok": False,
+            "error": "Symbole invalide."
+        }), 400
+
+    logger.info(
+        "Webhook reçu | %s | %s | %s",
+        received_at,
+        action.upper(),
+        symbol
+    )
+
+    # --------------------------------------------------------
+    # ANTI-DOUBLON
+    # --------------------------------------------------------
+
+    if is_duplicate_signal(
+        action,
+        symbol
+    ):
+
+        notify(
+            (
+                f"⚠️ Signal dupliqué ignoré\n"
+                f"{action.upper()} {symbol}"
+            )
+        )
+
+        return jsonify({
+            "ok": True,
+            "ignored": True,
+            "reason": "duplicate"
+        }), 200
+
+    # --------------------------------------------------------
+    # COOLDOWN
+    # --------------------------------------------------------
+
+    if is_action_on_cooldown(
+        action,
+        symbol
+    ):
+
+        notify(
+            (
+                f"⏳ Cooldown actif\n"
+                f"{action.upper()} {symbol}"
+            )
+        )
+
+        return jsonify({
+            "ok": True,
+            "ignored": True,
+            "reason": "cooldown"
+        }), 200
+
+    # --------------------------------------------------------
+    # TRADING ENABLED
+    # --------------------------------------------------------
+
+    if not TRADING_ENABLED:
+
+        notify(
+            (
+                f"⚠️ Signal reçu mais trading désactivé\n"
+                f"{action.upper()} {symbol}"
+            )
+        )
+
+        return jsonify({
+            "ok": True,
+            "ignored": True,
+            "reason": "trading_disabled"
+        }), 200
+
+    # --------------------------------------------------------
+    # TRAITEMENT
+    # --------------------------------------------------------
+
+    try:
 
         if action == "buy":
 
-            positions = get_open_positions()
-
-            # ---------------------------------------------------------------
-
-            # Nombre maximum de positions
-
-            # ---------------------------------------------------------------
-
-            if len(positions) >= MAX_OPEN_POSITIONS:
-
-                msg = (
-
-                    f"⚠️ [{timestamp}] "
-
-                    f"BUY {symbol} ignoré — "
-
-                    f"{len(positions)} positions déjà ouvertes"
-
-                )
-
-                log(msg)
-
-                send_telegram(msg)
-
-                return jsonify({
-
-                    "info": "nombre maximum de positions atteint"
-
-                }), 200
-
-            # ---------------------------------------------------------------
-
-            # Ne pas racheter le même symbole
-
-            # ---------------------------------------------------------------
-
-            existing_position = get_position(symbol)
-
-            if existing_position:
-
-                existing_qty = float(
-
-                    existing_position.get("qty", 0)
-
-                )
-
-                if existing_qty > 0:
-
-                    msg = (
-
-                        f"⚠️ [{timestamp}] "
-
-                        f"BUY {symbol} ignoré — "
-
-                        f"position déjà ouverte "
-
-                        f"({existing_qty:g} actions)"
-
-                    )
-
-                    log(msg)
-
-                    send_telegram(msg)
-
-                    return jsonify({
-
-                        "info": "position déjà ouverte"
-
-                    }), 200
-
-            # ---------------------------------------------------------------
-
-            # Prix
-
-            # ---------------------------------------------------------------
-
-            price = get_latest_price(symbol)
-
-            # ---------------------------------------------------------------
-
-            # CALCUL DE QUANTITÉ
-
-            # ---------------------------------------------------------------
-
-            qty = calculate_buy_quantity(
-
-                symbol,
-
-                price,
-
-            )
-
-            # ---------------------------------------------------------------
-
-            # Sécurité finale
-
-            # ---------------------------------------------------------------
-
-            if qty < 1:
-
-                raise ValueError(
-
-                    "Quantité finale inférieure à 1"
-
-                )
-
-            if qty > MAX_QTY:
-
-                raise ValueError(
-
-                    f"Protection : qty={qty} > MAX_QTY={MAX_QTY}"
-
-                )
-
-            estimated_value = qty * price
-
-            log(
-
-                f"ORDRE AUTORISÉ : "
-
-                f"BUY {qty} {symbol} "
-
-                f"≈ {estimated_value:.2f}$"
-
-            )
-
-            # ---------------------------------------------------------------
-
-            # ENVOI ALPACA
-
-            # ---------------------------------------------------------------
-
-            order_result = submit_market_order(
-
-                symbol,
-
-                "buy",
-
-                qty,
-
-            )
-
-            mark_traded(
-
-                symbol,
-
-                action,
-
-            )
-
-            order_id = order_result["id"]
-
-            # ---------------------------------------------------------------
-
-            # ATTENTE DU FILL
-
-            # ---------------------------------------------------------------
-
-            filled_order = poll_order_fill(
-
-                order_id
-
-            )
-
-            if not filled_order:
-
-                msg = (
-
-                    f"⚠️ [{timestamp}] "
-
-                    f"BUY {qty} {symbol} envoyé, "
-
-                    f"mais statut de remplissage indisponible"
-
-                )
-
-                log(msg)
-
-                send_telegram(msg)
-
-                return jsonify(
-
-                    order_result
-
-                ), 200
-
-            status = filled_order.get(
-
-                "status",
-
-                "inconnu",
-
-            )
-
-            filled_qty_raw = filled_order.get(
-
-                "filled_qty",
-
-                0,
-
-            )
-
-            filled_qty = int(
-
-                float(filled_qty_raw or 0)
-
-            )
-
-            filled_avg_price = (
-
-                filled_order.get(
-
-                    "filled_avg_price"
-
-                )
-
-            )
-
-            # ---------------------------------------------------------------
-
-            # ORDRE REFUSÉ / ANNULÉ
-
-            # ---------------------------------------------------------------
-
-            if status in (
-
-                "rejected",
-
-                "canceled",
-
-                "expired",
-
-            ):
-
-                msg = (
-
-                    f"❌ [{timestamp}] "
-
-                    f"BUY {symbol} refusé/annulé "
-
-                    f"| statut={status}"
-
-                )
-
-                log(msg)
-
-                send_telegram(msg)
-
-                return jsonify(
-
-                    filled_order
-
-                ), 200
-
-            # ---------------------------------------------------------------
-
-            # SL / TP
-
-            # ---------------------------------------------------------------
-
-            sl_tp_text = (
-
-                "SL/TP non posés"
-
-            )
-
-            if (
-
-                status == "filled"
-
-                and filled_qty > 0
-
-                and filled_avg_price
-
-            ):
-
-                entry_price = float(
-
-                    filled_avg_price
-
-                )
-
-                try:
-
-                    stop_price, take_profit_price = (
-
-                        place_exit_orders(
-
-                            symbol,
-
-                            filled_qty,
-
-                            entry_price,
-
-                        )
-
-                    )
-
-                    sl_tp_text = (
-
-                        f"SL {stop_price:.2f} | "
-
-                        f"TP {take_profit_price:.2f}"
-
-                    )
-
-                except Exception as e:
-
-                    sl_tp_text = (
-
-                        f"⚠️ échec SL/TP : {e}"
-
-                    )
-
-                    log(
-
-                        f"ERREUR CRITIQUE SL/TP "
-
-                        f"{symbol}: {e}"
-
-                    )
-
-                    send_telegram(
-
-                        f"🚨 SL/TP non posé sur "
-
-                        f"{symbol} après BUY : {e}"
-
-                    )
-
-            # ---------------------------------------------------------------
-
-            # TELEGRAM
-
-            # ---------------------------------------------------------------
-
-            if filled_avg_price:
-
-                price_text = (
-
-                    f"Prix : "
-
-                    f"{float(filled_avg_price):.2f}$"
-
-                )
-
-            else:
-
-                price_text = (
-
-                    "Prix : indisponible"
-
-                )
-
-            msg = (
-
-                f"✅ [{timestamp}] "
-
-                f"BUY {filled_qty} {symbol}\n"
-
-                f"{price_text}\n"
-
-                f"{sl_tp_text}\n"
-
-                f"Risque/trade : "
-
-                f"{RISK_PER_TRADE_PERCENT:.2f}%\n"
-
-                f"Statut : {status}"
-
-            )
-
-            log(msg)
-
-            send_telegram(msg)
-
-            return jsonify(
-
-                filled_order
-
-            ), 200
-
-        # ====================================================================
-
-        # SELL
-
-        # ====================================================================
+            result = handle_buy(symbol)
 
         else:
 
-            position = get_position(symbol)
+            result = handle_sell(symbol)
 
-            if not position:
+        return jsonify(result), 200
 
-                msg = (
+    except Exception as exc:
 
-                    f"⚠️ [{timestamp}] "
-
-                    f"SELL {symbol} ignoré — "
-
-                    f"aucune position"
-
-                )
-
-                log(msg)
-
-                send_telegram(msg)
-
-                return jsonify({
-
-                    "info": "aucune position"
-
-                }), 200
-
-            held_qty = float(
-
-                position.get("qty", 0)
-
-            )
-
-            if held_qty <= 0:
-
-                msg = (
-
-                    f"⚠️ [{timestamp}] "
-
-                    f"SELL {symbol} ignoré — "
-
-                    f"quantité détenue nulle"
-
-                )
-
-                log(msg)
-
-                send_telegram(msg)
-
-                return jsonify({
-
-                    "info": "quantité détenue nulle"
-
-                }), 200
-
-            # Comme les BUY sont limités à MAX_QTY,
-
-            # on ferme ici toute la position détenue.
-
-            sell_qty = int(held_qty)
-
-            if sell_qty <= 0:
-
-                raise ValueError(
-
-                    "Quantité de vente invalide"
-
-                )
-
-            # ---------------------------------------------------------------
-
-            # Envoi SELL
-
-            # ---------------------------------------------------------------
-
-            order_result = submit_market_order(
-
-                symbol,
-
-                "sell",
-
-                sell_qty,
-
-            )
-
-            mark_traded(
-
-                symbol,
-
-                action,
-
-            )
-
-            status = order_result.get(
-
-                "status",
-
-                "inconnu",
-
-            )
-
-            msg = (
-
-                f"✅ [{timestamp}] "
-
-                f"SELL {sell_qty} {symbol}\n"
-
-                f"Statut : {status}"
-
-            )
-
-            log(msg)
-
-            send_telegram(msg)
-
-            return jsonify(
-
-                order_result
-
-            ), 200
-
-    # =========================================================================
-
-    # ERREURS
-
-    # =========================================================================
-
-    except requests.exceptions.RequestException as e:
-
-        msg = (
-
-            f"🚨 [{timestamp}] "
-
-            f"Erreur Alpaca sur {symbol} : {e}"
-
+        logger.exception(
+            "Erreur traitement webhook"
         )
 
-        log(msg)
-
-        send_telegram(msg)
-
-        return jsonify({
-
-            "error": "erreur de connexion à Alpaca",
-
-            "details": str(e),
-
-        }), 502
-
-    except Exception as e:
-
-        msg = (
-
-            f"🚨 [{timestamp}] "
-
-            f"Erreur sur {symbol} : {e}"
-
+        notify(
+            (
+                f"🚨 ERREUR BOT\n"
+                f"Action : {action.upper()}\n"
+                f"Symbole : {symbol}\n"
+                f"Erreur : {exc}"
+            )
         )
 
-        log(msg)
-
-        send_telegram(msg)
-
         return jsonify({
-
-            "error": "erreur inattendue",
-
-            "details": str(e),
-
+            "ok": False,
+            "error": str(exc)
         }), 500
 
-# ============================================================================
 
+# ============================================================
 # HEALTH CHECK
-
-# ============================================================================
+# ============================================================
 
 @app.route("/", methods=["GET"])
+def home():
 
-def health_check():
+    return jsonify({
+        "ok": True,
+        "service": APP_NAME,
+        "mode": "PAPER",
+        "trading_enabled": TRADING_ENABLED,
+        "time": utc_string()
+    })
+
+
+@app.route("/health", methods=["GET"])
+def health():
 
     try:
 
         account = get_account()
 
-        alpaca_status = (
+        return jsonify({
+            "ok": True,
+            "alpaca": "connected",
+            "paper": True,
+            "account_status": account.get("status"),
+            "trading_blocked": account.get(
+                "trading_blocked"
+            ),
+            "time": utc_string()
+        })
 
-            f"Alpaca OK | "
+    except Exception as exc:
 
-            f"equity={account.get('equity')} | "
+        return jsonify({
+            "ok": False,
+            "alpaca": "error",
+            "error": str(exc),
+            "time": utc_string()
+        }), 503
 
-            f"buying_power={account.get('buying_power')}"
 
-        )
-
-    except Exception as e:
-
-        alpaca_status = (
-
-            f"Alpaca injoignable : {e}"
-
-        )
-
-    status = (
-
-        "actif"
-
-        if TRADING_ENABLED
-
-        else "en pause"
-
-    )
-
-    return (
-
-        f"Bot webhook {status}. "
-
-        f"{alpaca_status}",
-
-        200,
-
-    )
-
-# ============================================================================
-
-# DÉMARRAGE
-
-# ============================================================================
-
-check_env_vars_or_exit()
+# ============================================================
+# START
+# ============================================================
 
 if __name__ == "__main__":
 
     port = int(
-
-        os.environ.get(
-
+        os.getenv(
             "PORT",
-
-            5000,
-
+            "10000"
         )
+    )
 
+    logger.info(
+        "=========================================="
+    )
+
+    logger.info(
+        "%s",
+        APP_NAME
+    )
+
+    logger.info(
+        "MODE : ALPACA PAPER TRADING"
+    )
+
+    logger.info(
+        "TRADING ENABLED : %s",
+        TRADING_ENABLED
+    )
+
+    logger.info(
+        "RISK / TRADE : %.2f%%",
+        RISK_PER_TRADE_PERCENT
+    )
+
+    logger.info(
+        "STOP LOSS : %.2f%%",
+        STOP_LOSS_PERCENT
+    )
+
+    logger.info(
+        "TAKE PROFIT : %.2f%%",
+        TAKE_PROFIT_PERCENT
+    )
+
+    logger.info(
+        "MAX QTY : %d",
+        MAX_QTY
+    )
+
+    logger.info(
+        "MAX POSITIONS : %d",
+        MAX_OPEN_POSITIONS
+    )
+
+    logger.info(
+        "MAX POSITION VALUE : %.2f%%",
+        MAX_POSITION_VALUE_PERCENT
+    )
+
+    logger.info(
+        "=========================================="
     )
 
     app.run(
-
         host="0.0.0.0",
-
-        port=port,
-
+        port=port
     )
